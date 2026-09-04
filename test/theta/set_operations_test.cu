@@ -74,18 +74,18 @@ TEST_CASE("Theta exact union intersection and A-not-B", "[theta][setops]")
 
   auto union_result = clone(stream, mr, a, lg_k);
   union_result.merge(stream, b);
-  REQUIRE(union_result.get_estimate() == 1500.0);
-  REQUIRE(union_result.get_num_retained() == 1500);
+  REQUIRE(union_result.get_estimate(stream) == 1500.0);
+  REQUIRE(union_result.get_num_retained(stream) == 1500);
 
   auto intersection_result = clone(stream, mr, a, lg_k);
   intersection_result.intersect(stream, b);
-  REQUIRE(intersection_result.get_estimate() == 500.0);
-  REQUIRE(intersection_result.get_num_retained() == 500);
+  REQUIRE(intersection_result.get_estimate(stream) == 500.0);
+  REQUIRE(intersection_result.get_num_retained(stream) == 500);
 
   auto difference_result = clone(stream, mr, a, lg_k);
   difference_result.a_not_b(stream, b);
-  REQUIRE(difference_result.get_estimate() == 500.0);
-  REQUIRE(difference_result.get_num_retained() == 500);
+  REQUIRE(difference_result.get_estimate(stream) == 500.0);
+  REQUIRE(difference_result.get_num_retained(stream) == 500);
 }
 
 TEST_CASE("Theta exact disjoint intersection is empty", "[theta][setops][empty]")
@@ -103,8 +103,8 @@ TEST_CASE("Theta exact disjoint intersection is empty", "[theta][setops][empty]"
   b.update(stream, b_device.begin(), b_device.end());
 
   a.intersect(stream, b);
-  REQUIRE(a.is_empty());
-  REQUIRE(a.get_estimate() == 0.0);
+  REQUIRE(a.is_empty(stream));
+  REQUIRE(a.get_estimate(stream) == 0.0);
 }
 
 TEST_CASE("Theta set operations reject seed mismatch", "[theta][setops][seed]")
@@ -126,7 +126,7 @@ TEST_CASE("Theta set operations reject seed mismatch", "[theta][setops][seed]")
 
 TEST_CASE("Theta union trims to target k", "[theta][setops][estimation]")
 {
-  constexpr std::uint8_t lg_k                   = 8;
+  constexpr std::uint8_t lg_k                   = 12;
   auto a_values                                 = sequence(0, 10000);
   auto b_values                                 = sequence(10000, 20000);
   thrust::device_vector<std::uint64_t> a_device = a_values;
@@ -140,9 +140,9 @@ TEST_CASE("Theta union trims to target k", "[theta][setops][estimation]")
   b.update(stream, b_device.begin(), b_device.end());
 
   a.merge(stream, b);
-  REQUIRE(a.is_estimation_mode());
-  REQUIRE(a.get_num_retained() == (std::size_t{1} << lg_k));
-  const double relative_error = std::abs(a.get_estimate() - 20000.0) / 20000.0;
+  REQUIRE(a.is_estimation_mode(stream));
+  REQUIRE(a.get_num_retained(stream) == (std::size_t{1} << lg_k));
+  const double relative_error = std::abs(a.get_estimate(stream) - 20000.0) / 20000.0;
   REQUIRE(relative_error < 0.2);
 }
 
@@ -167,7 +167,7 @@ TEST_CASE("Theta empty sampled union applies its configured p", "[theta][setops]
 TEST_CASE("Theta estimated set operations match CPU compact bytes",
           "[theta][setops][parity][serialization]")
 {
-  constexpr std::uint8_t lg_k = 8;
+  constexpr std::uint8_t lg_k = 12;
   auto a_values               = sequence(0, 10000);
   auto b_values               = sequence(5000, 15000);
   const auto cpu              = theta_test::cpu_set_operation_images(a_values, b_values, lg_k);

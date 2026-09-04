@@ -45,9 +45,9 @@
 #include <cuda/experimental/memory_resource.cuh>
 
 #include <datasketches/cuda/detail/common/error.hpp>
+#include <datasketches/cuda/detail/theta/persistent_update.cuh>
 #include <datasketches/cuda/detail/theta/policy.cuh>
 #include <datasketches/cuda/detail/theta/preamble.hpp>
-#include <datasketches/cuda/detail/theta/screen.cuh>
 
 #include <binomial_bounds.hpp>
 
@@ -60,6 +60,7 @@ struct sketch_impl {
   using count_type        = std::uint64_t;
   using hash_buffer_type  = ::cuda::device_buffer<hash_type>;
   using count_buffer_type = ::cuda::device_buffer<count_type>;
+  using state_buffer_type = ::cuda::device_buffer<device_state>;
   using env_type          = ::cuda::experimental::env_t<::cuda::mr::device_accessible>;
 
   struct buffer_result {
@@ -67,24 +68,79 @@ struct sketch_impl {
     std::size_t size;
   };
 
+  struct persistent_runtime_config {
+    std::size_t set_slots;
+    std::size_t shared_bytes;
+    std::size_t sm_count;
+    std::size_t max_grid_blocks;
+  };
+
+  [[nodiscard]] static persistent_runtime_config make_persistent_runtime_config_()
+  {
+    int device{};
+    int max_block_shared{};
+    int max_sm_shared{};
+    int sms{};
+    DATASKETCHES_CUDA_TRY(cudaGetDevice(&device));
+    DATASKETCHES_CUDA_TRY(
+      cudaDeviceGetAttribute(&max_block_shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    DATASKETCHES_CUDA_TRY(
+      cudaDeviceGetAttribute(&max_sm_shared, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device));
+    DATASKETCHES_CUDA_TRY(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+
+    if (max_block_shared <= 0 || max_sm_shared <= 0 || sms <= 0) {
+      throw std::runtime_error("theta_sketch could not determine device resources");
+    }
+
+    const auto fixed_bytes =
+      histogram_bytes + sizeof(persistent_control) + alignof(persistent_control);
+    const auto shared_budget = std::min(
+      static_cast<std::size_t>(max_block_shared),
+      static_cast<std::size_t>(max_sm_shared) / persistent_update_config::target_blocks_per_sm);
+    if (shared_budget <= fixed_bytes) {
+      throw std::runtime_error("theta_sketch device has insufficient shared memory");
+    }
+
+    const auto slots = (shared_budget - fixed_bytes) / sizeof(hash_type);
+    const auto bytes = theta::required_shared_bytes(slots);
+    if (max_occupied(slots) <
+        persistent_update_config::retained_capacity + persistent_update_config::max_block_threads) {
+      throw std::runtime_error("theta_sketch device cannot fit k plus one block in shared memory");
+    }
+    const auto blocks_per_sm = std::max(1, max_sm_shared / static_cast<int>(bytes));
+    return {slots,
+            bytes,
+            static_cast<std::size_t>(sms),
+            static_cast<std::size_t>(sms) * static_cast<std::size_t>(blocks_per_sm)};
+  }
+
   std::uint8_t lg_k_;
   std::uint64_t seed_;
   float p_;
-  std::uint64_t theta_;
-  bool is_empty_;
-  ::cuda::stream_ref allocation_stream_;
   MR mr_;
+  persistent_runtime_config persistent_config_;
+  std::size_t candidate_capacity_;
   hash_buffer_type hashes_;
+  state_buffer_type state_;
+  hash_buffer_type candidates_;
+  hash_buffer_type alternate_;
+  hash_buffer_type unique_;
+  count_buffer_type unique_count_;
 
   sketch_impl(::cuda::stream_ref stream, MR mr, std::uint8_t lg_k, std::uint64_t seed, float p)
     : lg_k_(check_lg_k_(lg_k)),
       seed_(seed),
       p_(check_p_(p)),
-      theta_(starting_theta_(p_)),
-      is_empty_(true),
-      allocation_stream_(stream),
       mr_(std::move(mr)),
-      hashes_(make_hash_buffer_(stream, 0))
+      persistent_config_(make_persistent_runtime_config_()),
+      candidate_capacity_(k_() + persistent_config_.max_grid_blocks *
+                                   persistent_update_config::block_output_slots),
+      hashes_(make_filled_hash_buffer_(stream, k_(), empty_key)),
+      state_(make_state_buffer_(stream, device_state{starting_theta_(p_), 0, 1})),
+      candidates_(make_hash_buffer_(stream, candidate_capacity_)),
+      alternate_(make_hash_buffer_(stream, candidate_capacity_)),
+      unique_(make_hash_buffer_(stream, candidate_capacity_)),
+      unique_count_(make_count_buffer_(stream))
   {
   }
 
@@ -96,8 +152,8 @@ struct sketch_impl {
 
   static std::uint8_t check_lg_k_(std::uint8_t lg_k)
   {
-    if (lg_k < min_lg_k || lg_k > max_lg_k) {
-      throw std::invalid_argument("theta_sketch lg_k must be in [5, 26]");
+    if (lg_k != default_lg_k) {
+      throw std::invalid_argument("theta_sketch prototype supports only lg_k == 12");
     }
     return lg_k;
   }
@@ -117,11 +173,6 @@ struct sketch_impl {
 
   [[nodiscard]] std::size_t k_() const noexcept { return std::size_t{1} << lg_k_; }
 
-  [[nodiscard]] std::uint64_t effective_theta_() const noexcept
-  {
-    return is_empty_ ? max_theta : theta_;
-  }
-
   [[nodiscard]] env_type env_(::cuda::stream_ref stream) const { return env_type{mr_, stream}; }
 
   [[nodiscard]] hash_buffer_type make_hash_buffer_(::cuda::stream_ref stream,
@@ -131,10 +182,23 @@ struct sketch_impl {
       stream, mr_, count, ::cuda::no_init);
   }
 
+  [[nodiscard]] hash_buffer_type make_filled_hash_buffer_(::cuda::stream_ref stream,
+                                                          std::size_t count,
+                                                          hash_type value) const
+  {
+    return ::cuda::make_buffer<hash_type, ::cuda::mr::device_accessible>(stream, mr_, count, value);
+  }
+
   [[nodiscard]] count_buffer_type make_count_buffer_(::cuda::stream_ref stream) const
   {
     return ::cuda::make_buffer<count_type, ::cuda::mr::device_accessible>(
       stream, mr_, 1, count_type{0});
+  }
+
+  [[nodiscard]] state_buffer_type make_state_buffer_(::cuda::stream_ref stream,
+                                                     device_state state) const
+  {
+    return ::cuda::make_buffer<device_state, ::cuda::mr::device_accessible>(stream, mr_, 1, state);
   }
 
   [[nodiscard]] static std::int64_t cub_count_(std::size_t count)
@@ -156,6 +220,70 @@ struct sketch_impl {
       throw std::length_error("theta_sketch selected item count exceeds size_t");
     }
     return static_cast<std::size_t>(host_count);
+  }
+
+  [[nodiscard]] device_state read_state_(::cuda::stream_ref stream) const
+  {
+    device_state state{};
+    DATASKETCHES_CUDA_TRY(
+      cudaMemcpyAsync(&state, state_.data(), sizeof(state), cudaMemcpyDeviceToHost, stream.get()));
+    stream.sync();
+    return state;
+  }
+
+  void write_state_(::cuda::stream_ref stream, device_state state)
+  {
+    DATASKETCHES_CUDA_TRY(
+      cudaMemcpyAsync(state_.data(), &state, sizeof(state), cudaMemcpyHostToDevice, stream.get()));
+  }
+
+  [[nodiscard]] static std::uint64_t effective_theta_(device_state state) noexcept
+  {
+    return state.empty != 0 ? max_theta : state.theta;
+  }
+
+  struct persistent_launch_config {
+    int grid_size;
+    int block_size;
+  };
+
+  template <class RandomAccessIt>
+  [[nodiscard]] persistent_launch_config configure_persistent_kernel_() const
+  {
+    const auto kernel = persistent_update_kernel<RandomAccessIt, theta_hash<Key>>;
+    DATASKETCHES_CUDA_TRY(cudaFuncSetAttribute(kernel,
+                                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                               static_cast<int>(persistent_config_.shared_bytes)));
+
+    int minimum_grid_size{};
+    int block_size{};
+    DATASKETCHES_CUDA_TRY(
+      cudaOccupancyMaxPotentialBlockSize(&minimum_grid_size,
+                                         &block_size,
+                                         kernel,
+                                         persistent_config_.shared_bytes,
+                                         persistent_update_config::max_block_threads));
+
+    const auto safe_threads =
+      max_occupied(persistent_config_.set_slots) - persistent_update_config::retained_capacity;
+    block_size = std::min(block_size, static_cast<int>(safe_threads));
+    block_size = block_size / 32 * 32;
+    if (block_size != persistent_update_config::max_block_threads) {
+      throw std::runtime_error("theta_sketch persistent kernel requires a 1024-thread block");
+    }
+
+    int active_blocks{};
+    DATASKETCHES_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &active_blocks, kernel, block_size, persistent_config_.shared_bytes));
+    if (active_blocks < 1) {
+      throw std::runtime_error(
+        "theta_sketch persistent kernel has no resident launch configuration");
+    }
+    const auto grid_size = static_cast<std::size_t>(active_blocks) * persistent_config_.sm_count;
+    if (grid_size > persistent_config_.max_grid_blocks) {
+      throw std::runtime_error("theta_sketch persistent grid exceeds scratch capacity");
+    }
+    return {static_cast<int>(grid_size), block_size};
   }
 
   [[nodiscard]] buffer_result select_(::cuda::stream_ref stream,
@@ -224,26 +352,6 @@ struct sketch_impl {
     return unique_sorted_(stream, keys.Current(), count);
   }
 
-  //! @brief Hashes, screens, and compacts a key range in one pass.
-  template <class RandomAccessIt>
-  [[nodiscard]] buffer_result screen_(::cuda::stream_ref stream,
-                                      RandomAccessIt first,
-                                      std::size_t count) const
-  {
-    auto output = make_hash_buffer_(stream, count);
-    if (count == 0) return {std::move(output), 0};
-    auto selected = make_count_buffer_(stream);
-    screen_kernel<<<screen_grid_size(count), screen_block_threads, 0, stream.get()>>>(
-      first,
-      count,
-      theta_hash<Key>{seed_},
-      theta_,
-      output.data(),
-      reinterpret_cast<unsigned long long*>(selected.data()));
-    DATASKETCHES_CUDA_TRY(cudaGetLastError());
-    return {std::move(output), read_count_(stream, selected)};
-  }
-
   [[nodiscard]] buffer_result merge_unique_(::cuda::stream_ref stream,
                                             const hash_type* first,
                                             std::size_t first_size,
@@ -278,20 +386,6 @@ struct sketch_impl {
     return unique_sorted_(stream, merged.data(), merged_size);
   }
 
-  [[nodiscard]] hash_buffer_type copy_prefix_(::cuda::stream_ref stream,
-                                              const hash_type* input,
-                                              std::size_t count) const
-  {
-    auto output = make_hash_buffer_(stream, count);
-    if (count != 0) {
-      DATASKETCHES_CUDA_TRY(cudaMemcpyAsync(
-        output.data(), input, count * sizeof(hash_type), cudaMemcpyDeviceToDevice, stream.get()));
-    }
-    stream.sync();
-    output.set_stream(allocation_stream_);
-    return output;
-  }
-
   void install_(::cuda::stream_ref stream,
                 const hash_type* input,
                 std::size_t count,
@@ -306,70 +400,30 @@ struct sketch_impl {
       stream.sync();
       retained = k_();
     }
-    auto next = copy_prefix_(stream, input, retained);
-    hashes_   = std::move(next);
-    theta_    = empty ? starting_theta_(p_) : theta;
-    is_empty_ = empty;
+    DATASKETCHES_CUDA_TRY(
+      cudaMemsetAsync(hashes_.data(), 0xff, hashes_.size() * sizeof(hash_type), stream.get()));
+    if (retained != 0) {
+      DATASKETCHES_CUDA_TRY(cudaMemcpyAsync(hashes_.data(),
+                                            input,
+                                            retained * sizeof(hash_type),
+                                            cudaMemcpyDeviceToDevice,
+                                            stream.get()));
+    }
+    write_state_(stream,
+                 device_state{empty ? starting_theta_(p_) : theta, retained, empty ? 1U : 0U});
+    stream.sync();
   }
 
   void set_empty_(::cuda::stream_ref stream)
   {
-    auto empty = make_hash_buffer_(stream, 0);
+    DATASKETCHES_CUDA_TRY(
+      cudaMemsetAsync(hashes_.data(), 0xff, hashes_.size() * sizeof(hash_type), stream.get()));
+    write_state_(stream, device_state{starting_theta_(p_), 0, 1});
     stream.sync();
-    empty.set_stream(allocation_stream_);
-    hashes_   = std::move(empty);
-    theta_    = starting_theta_(p_);
-    is_empty_ = true;
-  }
-
-  //! @brief Multiple of k a first chunk aims to cover.
-  //!
-  //! With theta at its maximum every key survives, so a chunk of this many keys
-  //! yields that many candidates for a sketch that keeps k. A few multiples of k
-  //! is enough to drive theta below its maximum whenever the batch holds at
-  //! least k distinct keys, while keeping the sort that chunk pays for small.
-  static constexpr std::size_t chunk_target_multiple = 16;
-
-  //! @brief Smallest chunk worth a launch.
-  //!
-  //! A chunk costs a kernel launch and a synchronization regardless of its size,
-  //! so very small k values should not produce correspondingly tiny chunks.
-  static constexpr std::size_t min_chunk_keys = std::size_t{1} << 20;
-
-  //! @brief Size of the next update chunk.
-  //!
-  //! Entering an update with theta at its maximum means no key is rejected, so a
-  //! single pass over a large batch would sort the whole batch even though the
-  //! sketch keeps only k entries. Splitting lets theta tighten partway through,
-  //! exactly as the CPU sketch does on every insert, after which the remaining
-  //! keys are screened rather than sorted.
-  //!
-  //! Once theta has left its maximum the sketch holds k entries and the pass
-  //! rate is bounded by k over the distinct keys seen, so the remainder is taken
-  //! in one pass; splitting further would only add launches. Chunks double while
-  //! theta does stay at its maximum, which bounds the pass count logarithmically
-  //! for a batch that holds fewer than k distinct keys.
-  [[nodiscard]] std::size_t next_chunk_(std::size_t remaining, std::size_t previous) const noexcept
-  {
-    if (theta_ != max_theta) return remaining;
-    const auto sized = std::max({chunk_target_multiple * k_(), min_chunk_keys, previous * 2});
-    return std::min(sized, remaining);
   }
 
   template <class RandomAccessIt>
-  void update_chunk_(::cuda::stream_ref stream, RandomAccessIt first, std::size_t count)
-  {
-    auto screened = screen_(stream, first, count);
-    if (screened.size == 0) return;
-
-    auto incoming = sort_unique_(stream, std::move(screened.data), screened.size, theta_);
-    auto combined =
-      merge_unique_(stream, hashes_.data(), hashes_.size(), incoming.data.data(), incoming.size);
-    install_(stream, combined.data.data(), combined.size, theta_, false, true);
-  }
-
-  template <class RandomAccessIt>
-  void update(::cuda::stream_ref stream, RandomAccessIt first, RandomAccessIt last)
+  void update_async(::cuda::stream_ref stream, RandomAccessIt first, RandomAccessIt last)
   {
     const auto distance = last - first;
     if (distance < 0) {
@@ -377,30 +431,67 @@ struct sketch_impl {
     }
     const auto count = static_cast<std::size_t>(distance);
     if (count == 0) return;
+    const auto launch          = configure_persistent_kernel_<RandomAccessIt>();
+    const auto blocks          = std::min(static_cast<std::size_t>(launch.grid_size),
+                                 (count + static_cast<std::size_t>(launch.block_size) - 1) /
+                                   static_cast<std::size_t>(launch.block_size));
+    const auto candidate_count = k_() + blocks * persistent_update_config::block_output_slots;
 
-    is_empty_ = false;
+    DATASKETCHES_CUDA_TRY(cudaMemcpyAsync(candidates_.data(),
+                                          hashes_.data(),
+                                          k_() * sizeof(hash_type),
+                                          cudaMemcpyDeviceToDevice,
+                                          stream.get()));
 
-    std::size_t offset   = 0;
-    std::size_t previous = 0;
-    while (offset < count) {
-      const auto chunk = next_chunk_(count - offset, previous);
-      update_chunk_(stream, first + offset, chunk);
-      offset += chunk;
-      previous = chunk;
-    }
+    persistent_update_kernel<<<static_cast<unsigned int>(blocks),
+                               launch.block_size,
+                               persistent_config_.shared_bytes,
+                               stream.get()>>>(first,
+                                               count,
+                                               theta_hash<Key>{seed_},
+                                               state_.data(),
+                                               candidates_.data() + k_(),
+                                               persistent_config_.set_slots,
+                                               max_occupied(persistent_config_.set_slots));
+    DATASKETCHES_CUDA_TRY(cudaGetLastError());
+
+    cub::DoubleBuffer<hash_type> sorted(candidates_.data(), alternate_.data());
+    DATASKETCHES_CUDA_TRY(
+      cub::DeviceRadixSort::SortKeys(sorted, cub_count_(candidate_count), 0, 63, env_(stream)));
+    DATASKETCHES_CUDA_TRY(cub::DeviceSelect::Unique(sorted.Current(),
+                                                    unique_.data(),
+                                                    unique_count_.data(),
+                                                    cub_count_(candidate_count),
+                                                    env_(stream)));
+
+    finalize_update_kernel<<<1, 256, 0, stream.get()>>>(
+      unique_.data(), unique_count_.data(), hashes_.data(), state_.data(), true);
+    DATASKETCHES_CUDA_TRY(cudaGetLastError());
+  }
+
+  template <class RandomAccessIt>
+  void update(::cuda::stream_ref stream, RandomAccessIt first, RandomAccessIt last)
+  {
+    update_async(stream, first, last);
+    stream.sync();
   }
 
   template <class OtherMR>
   void merge(::cuda::stream_ref stream, const sketch_impl<Key, OtherMR>& other)
   {
-    if (other.is_empty_) return;
+    const auto self_state  = read_state_(stream);
+    const auto other_state = other.read_state_(stream);
+    if (other_state.empty != 0) return;
     if (::compute_seed_hash(seed_) != ::compute_seed_hash(other.seed_)) {
       throw std::invalid_argument("theta_sketch::merge: seed hash mismatch");
     }
 
-    const std::uint64_t theta = std::min(theta_, other.effective_theta_());
-    auto combined             = merge_unique_(
-      stream, hashes_.data(), hashes_.size(), other.hashes_.data(), other.hashes_.size());
+    const std::uint64_t theta = std::min(self_state.theta, effective_theta_(other_state));
+    auto combined             = merge_unique_(stream,
+                                  hashes_.data(),
+                                  static_cast<std::size_t>(self_state.count),
+                                  other.hashes_.data(),
+                                  static_cast<std::size_t>(other_state.count));
     auto screened = select_(stream, combined.data.data(), combined.size, screen_hash{theta});
     install_(stream, screened.data.data(), screened.size, theta, false, true);
   }
@@ -408,8 +499,10 @@ struct sketch_impl {
   template <class OtherMR>
   void intersect(::cuda::stream_ref stream, const sketch_impl<Key, OtherMR>& other)
   {
-    if (is_empty_) return;
-    if (other.is_empty_) {
+    const auto self_state  = read_state_(stream);
+    const auto other_state = other.read_state_(stream);
+    if (self_state.empty != 0) return;
+    if (other_state.empty != 0) {
       set_empty_(stream);
       return;
     }
@@ -417,12 +510,14 @@ struct sketch_impl {
       throw std::invalid_argument("theta_sketch::intersect: seed hash mismatch");
     }
 
-    const std::uint64_t theta = std::min(effective_theta_(), other.effective_theta_());
+    const std::uint64_t theta =
+      std::min(effective_theta_(self_state), effective_theta_(other_state));
     auto result =
       select_(stream,
               hashes_.data(),
-              hashes_.size(),
-              membership_filter{other.hashes_.data(), other.hashes_.size(), theta, true});
+              static_cast<std::size_t>(self_state.count),
+              membership_filter{
+                other.hashes_.data(), static_cast<std::size_t>(other_state.count), theta, true});
     const bool empty = result.size == 0 && theta == max_theta;
     install_(stream, result.data.data(), result.size, theta, empty, false);
   }
@@ -430,80 +525,111 @@ struct sketch_impl {
   template <class OtherMR>
   void a_not_b(::cuda::stream_ref stream, const sketch_impl<Key, OtherMR>& other)
   {
-    if (is_empty_ || (!hashes_.empty() && other.is_empty_)) return;
+    const auto self_state  = read_state_(stream);
+    const auto other_state = other.read_state_(stream);
+    if (self_state.empty != 0 || (self_state.count != 0 && other_state.empty != 0)) return;
     if (::compute_seed_hash(seed_) != ::compute_seed_hash(other.seed_)) {
       throw std::invalid_argument("theta_sketch::a_not_b: seed hash mismatch");
     }
 
-    const std::uint64_t theta = std::min(effective_theta_(), other.effective_theta_());
+    const std::uint64_t theta =
+      std::min(effective_theta_(self_state), effective_theta_(other_state));
     auto result =
       select_(stream,
               hashes_.data(),
-              hashes_.size(),
-              membership_filter{other.hashes_.data(), other.hashes_.size(), theta, false});
+              static_cast<std::size_t>(self_state.count),
+              membership_filter{
+                other.hashes_.data(), static_cast<std::size_t>(other_state.count), theta, false});
     const bool empty = result.size == 0 && theta == max_theta;
     install_(stream, result.data.data(), result.size, theta, empty, false);
   }
 
   void reset(::cuda::stream_ref stream) { set_empty_(stream); }
 
-  [[nodiscard]] bool is_empty() const noexcept { return is_empty_; }
-
-  [[nodiscard]] bool is_estimation_mode() const noexcept
+  [[nodiscard]] bool is_empty(::cuda::stream_ref stream) const
   {
-    return !is_empty_ && theta_ < max_theta;
+    return read_state_(stream).empty != 0;
+  }
+
+  [[nodiscard]] bool is_estimation_mode(::cuda::stream_ref stream) const
+  {
+    const auto state = read_state_(stream);
+    return state.empty == 0 && state.theta < max_theta;
   }
 
   [[nodiscard]] std::uint8_t get_lg_k() const noexcept { return lg_k_; }
 
-  [[nodiscard]] std::uint64_t get_theta64() const noexcept { return effective_theta_(); }
-
-  [[nodiscard]] double get_theta() const noexcept
+  [[nodiscard]] std::uint64_t get_theta64(::cuda::stream_ref stream) const
   {
-    return static_cast<double>(effective_theta_()) / static_cast<double>(max_theta);
+    return effective_theta_(read_state_(stream));
+  }
+
+  [[nodiscard]] double get_theta(::cuda::stream_ref stream) const
+  {
+    return static_cast<double>(get_theta64(stream)) / static_cast<double>(max_theta);
   }
 
   [[nodiscard]] std::uint16_t get_seed_hash() const noexcept { return ::compute_seed_hash(seed_); }
 
-  [[nodiscard]] std::size_t get_num_retained() const noexcept { return hashes_.size(); }
-
-  [[nodiscard]] double get_estimate() const noexcept
+  [[nodiscard]] std::size_t get_num_retained(::cuda::stream_ref stream) const
   {
-    return static_cast<double>(hashes_.size()) / get_theta();
+    return static_cast<std::size_t>(read_state_(stream).count);
   }
 
-  [[nodiscard]] double get_lower_bound(std::uint8_t num_std_devs) const
+  [[nodiscard]] double get_estimate(::cuda::stream_ref stream) const
   {
-    if (!is_estimation_mode()) return static_cast<double>(hashes_.size());
+    const auto state = read_state_(stream);
+    return static_cast<double>(state.count) /
+           (static_cast<double>(effective_theta_(state)) / static_cast<double>(max_theta));
+  }
+
+  [[nodiscard]] double get_lower_bound(::cuda::stream_ref stream, std::uint8_t num_std_devs) const
+  {
+    const auto state = read_state_(stream);
+    if (state.empty != 0 || state.theta == max_theta) { return static_cast<double>(state.count); }
     return ::datasketches::binomial_bounds::get_lower_bound(
-      hashes_.size(), get_theta(), num_std_devs);
+      state.count, static_cast<double>(state.theta) / static_cast<double>(max_theta), num_std_devs);
   }
 
-  [[nodiscard]] double get_upper_bound(std::uint8_t num_std_devs) const
+  [[nodiscard]] double get_upper_bound(::cuda::stream_ref stream, std::uint8_t num_std_devs) const
   {
-    if (!is_estimation_mode()) return static_cast<double>(hashes_.size());
+    const auto state = read_state_(stream);
+    if (state.empty != 0 || state.theta == max_theta) { return static_cast<double>(state.count); }
     return ::datasketches::binomial_bounds::get_upper_bound(
-      hashes_.size(), get_theta(), num_std_devs);
+      state.count, static_cast<double>(state.theta) / static_cast<double>(max_theta), num_std_devs);
   }
 
   [[nodiscard]] std::vector<hash_type> get_retained_hashes(::cuda::stream_ref stream) const
   {
-    std::vector<hash_type> entries(hashes_.size());
-    if (!entries.empty()) {
-      DATASKETCHES_CUDA_TRY(cudaMemcpyAsync(entries.data(),
-                                            hashes_.data(),
-                                            entries.size() * sizeof(hash_type),
-                                            cudaMemcpyDeviceToHost,
-                                            stream.get()));
-    }
+    device_state state{};
+    std::vector<hash_type> entries(k_());
+    DATASKETCHES_CUDA_TRY(
+      cudaMemcpyAsync(&state, state_.data(), sizeof(state), cudaMemcpyDeviceToHost, stream.get()));
+    DATASKETCHES_CUDA_TRY(cudaMemcpyAsync(entries.data(),
+                                          hashes_.data(),
+                                          entries.size() * sizeof(hash_type),
+                                          cudaMemcpyDeviceToHost,
+                                          stream.get()));
     stream.sync();
+    entries.resize(static_cast<std::size_t>(state.count));
     return entries;
   }
 
   [[nodiscard]] std::vector<std::uint8_t> serialize_compact(::cuda::stream_ref stream) const
   {
+    device_state state{};
+    std::vector<hash_type> entries(k_());
+    DATASKETCHES_CUDA_TRY(
+      cudaMemcpyAsync(&state, state_.data(), sizeof(state), cudaMemcpyDeviceToHost, stream.get()));
+    DATASKETCHES_CUDA_TRY(cudaMemcpyAsync(entries.data(),
+                                          hashes_.data(),
+                                          entries.size() * sizeof(hash_type),
+                                          cudaMemcpyDeviceToHost,
+                                          stream.get()));
+    stream.sync();
+    entries.resize(static_cast<std::size_t>(state.count));
     return serialize_compact_v3(
-      is_empty_, get_seed_hash(), effective_theta_(), get_retained_hashes(stream));
+      state.empty != 0, get_seed_hash(), effective_theta_(state), entries);
   }
 
   void load_compact_(::cuda::stream_ref stream, const compact_image& image)
@@ -512,19 +638,20 @@ struct sketch_impl {
       throw std::invalid_argument(
         "theta_sketch::deserialize: retained entries exceed configured nominal k");
     }
-    auto next = make_hash_buffer_(stream, image.entries.size());
+    DATASKETCHES_CUDA_TRY(
+      cudaMemsetAsync(hashes_.data(), 0xff, hashes_.size() * sizeof(hash_type), stream.get()));
     if (!image.entries.empty()) {
-      DATASKETCHES_CUDA_TRY(cudaMemcpyAsync(next.data(),
+      DATASKETCHES_CUDA_TRY(cudaMemcpyAsync(hashes_.data(),
                                             image.entries.data(),
                                             image.entries.size() * sizeof(hash_type),
                                             cudaMemcpyHostToDevice,
                                             stream.get()));
     }
+    write_state_(stream,
+                 device_state{image.empty ? starting_theta_(p_) : image.theta,
+                              image.entries.size(),
+                              image.empty ? 1U : 0U});
     stream.sync();
-    next.set_stream(allocation_stream_);
-    hashes_   = std::move(next);
-    theta_    = image.empty ? starting_theta_(p_) : image.theta;
-    is_empty_ = image.empty;
   }
 };
 

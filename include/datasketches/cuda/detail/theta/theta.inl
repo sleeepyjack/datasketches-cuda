@@ -38,6 +38,15 @@ void theta_sketch<Key, MR>::update(::cuda::stream_ref stream,
 }
 
 template <class Key, class MR>
+template <class RandomAccessIt>
+void theta_sketch<Key, MR>::update_async(::cuda::stream_ref stream,
+                                         RandomAccessIt first,
+                                         RandomAccessIt last)
+{
+  impl_.update_async(stream, first, last);
+}
+
+template <class Key, class MR>
 template <class OtherMR>
 void theta_sketch<Key, MR>::merge(::cuda::stream_ref stream,
                                   const theta_sketch<Key, OtherMR>& other)
@@ -68,15 +77,15 @@ void theta_sketch<Key, MR>::reset(::cuda::stream_ref stream)
 }
 
 template <class Key, class MR>
-bool theta_sketch<Key, MR>::is_empty() const noexcept
+bool theta_sketch<Key, MR>::is_empty(::cuda::stream_ref stream) const
 {
-  return impl_.is_empty();
+  return impl_.is_empty(stream);
 }
 
 template <class Key, class MR>
-bool theta_sketch<Key, MR>::is_estimation_mode() const noexcept
+bool theta_sketch<Key, MR>::is_estimation_mode(::cuda::stream_ref stream) const
 {
-  return impl_.is_estimation_mode();
+  return impl_.is_estimation_mode(stream);
 }
 
 template <class Key, class MR>
@@ -92,15 +101,15 @@ std::uint8_t theta_sketch<Key, MR>::get_lg_k() const noexcept
 }
 
 template <class Key, class MR>
-std::uint64_t theta_sketch<Key, MR>::get_theta64() const noexcept
+std::uint64_t theta_sketch<Key, MR>::get_theta64(::cuda::stream_ref stream) const
 {
-  return impl_.get_theta64();
+  return impl_.get_theta64(stream);
 }
 
 template <class Key, class MR>
-double theta_sketch<Key, MR>::get_theta() const noexcept
+double theta_sketch<Key, MR>::get_theta(::cuda::stream_ref stream) const
 {
-  return impl_.get_theta();
+  return impl_.get_theta(stream);
 }
 
 template <class Key, class MR>
@@ -110,27 +119,29 @@ std::uint16_t theta_sketch<Key, MR>::get_seed_hash() const noexcept
 }
 
 template <class Key, class MR>
-std::size_t theta_sketch<Key, MR>::get_num_retained() const noexcept
+std::size_t theta_sketch<Key, MR>::get_num_retained(::cuda::stream_ref stream) const
 {
-  return impl_.get_num_retained();
+  return impl_.get_num_retained(stream);
 }
 
 template <class Key, class MR>
-double theta_sketch<Key, MR>::get_estimate() const noexcept
+double theta_sketch<Key, MR>::get_estimate(::cuda::stream_ref stream) const
 {
-  return impl_.get_estimate();
+  return impl_.get_estimate(stream);
 }
 
 template <class Key, class MR>
-double theta_sketch<Key, MR>::get_lower_bound(std::uint8_t num_std_devs) const
+double theta_sketch<Key, MR>::get_lower_bound(::cuda::stream_ref stream,
+                                              std::uint8_t num_std_devs) const
 {
-  return impl_.get_lower_bound(num_std_devs);
+  return impl_.get_lower_bound(stream, num_std_devs);
 }
 
 template <class Key, class MR>
-double theta_sketch<Key, MR>::get_upper_bound(std::uint8_t num_std_devs) const
+double theta_sketch<Key, MR>::get_upper_bound(::cuda::stream_ref stream,
+                                              std::uint8_t num_std_devs) const
 {
-  return impl_.get_upper_bound(num_std_devs);
+  return impl_.get_upper_bound(stream, num_std_devs);
 }
 
 template <class Key, class MR>

@@ -82,26 +82,20 @@ a.update(stream, dev_a.begin(), dev_a.end());
 b.update(stream, dev_b.begin(), dev_b.end());
 
 a.intersect(stream, b);
-double estimate = a.get_estimate();
+double estimate = a.get_estimate(stream);
 
 auto bytes = a.serialize_compact(stream);
 auto cpu = datasketches::compact_theta_sketch::deserialize(
   bytes.data(), bytes.size());
 ```
 
-`theta_sketch` keeps ordered hashes in device memory. A batch update runs one
-kernel that hashes, screens against theta, drops duplicates it can cheaply
-recognize, and compacts the survivors, then folds them in with CUB radix sort,
-unique, and merge primitives. The duplicate filter is best-effort: it changes
-only how much redundant work reaches the sort, never the result. Input whose
-duplicates arrive close together, such as sorted or grouped data, updates
-several times faster as a result. An update that
-starts with theta at its maximum is split internally, so theta tightens partway
-through the batch rather than only at the end; without that, a large first batch
-would sort every key even though the sketch keeps only k. Its batch and set
-operations currently synchronize because result counts determine subsequent
-allocation sizes, which puts a fixed cost on each call: prefer fewer, larger
-updates over many small ones.
+The current Theta prototype supports only `lg_k=12`. A batch update uses an
+occupancy-sized persistent grid and derives its shared-memory set capacity from
+the active device's opt-in shared-memory limit. Each block retains its
+partition's smallest hashes, then a single device-wide sort and unique step
+produces the ordered sketch. `update_async` enqueues the pipeline without
+synchronizing; state-reading methods take a stream and synchronize before
+returning. Set operations remain synchronous.
 
 ## Build & Runtime Dependencies
 

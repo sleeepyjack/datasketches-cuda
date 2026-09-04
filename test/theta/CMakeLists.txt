@@ -28,5 +28,6 @@ function(ConfigureThetaTest TEST_NAME)
 endfunction()
 
 ConfigureThetaTest(THETA_BASIC_TEST basic_sketch_test.cu cpu_reference.cpp)
+ConfigureThetaTest(THETA_PERSISTENT_UPDATE_TEST persistent_update_test.cu)
 ConfigureThetaTest(THETA_SET_OPERATIONS_TEST set_operations_test.cu cpu_reference.cpp)
 ConfigureThetaTest(THETA_TYPED_PARITY_TEST parity_typed_test.cu cpu_reference.cpp)

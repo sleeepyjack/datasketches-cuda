@@ -35,18 +35,10 @@ namespace datasketches::cuda {
 //! @brief GPU Theta sketch with ordered compact serialization compatible with
 //! the datasketches::compact_theta_sketch serialization version 3.
 //!
-//! Updates are batch-oriented. A single kernel hashes each key, screens it
-//! against theta, filters duplicates, and compacts the survivors; CUB radix
-//! sort, unique, and merge primitives then fold those survivors into the
-//! retained set. The duplicate filter is best-effort and never affects the
-//! result, only how much redundant work reaches the sort. It costs a few percent
-//! when duplicates are scattered and pays back several times over when they
-//! arrive together, as they do in sorted or grouped input. An update that
-//! begins with theta at its maximum is split internally so theta tightens
-//! partway through the batch instead of after it. The retained hashes are always
-//! ordered and trimmed to the smallest k = 2^lg_k values. Union (merge),
-//! intersection, and A-not-B operate directly on those ordered device-resident
-//! hashes.
+//! Updates use an occupancy-sized persistent grid. Each block uses the device's
+//! available opt-in shared memory for an exact set of its partition's smallest
+//! hashes and emits at most k + 1 candidates. One device-wide sort and unique
+//! operation then produces the ordered retained set and theta.
 //!
 //! The current migration supports primitive device keys, uncompressed ordered
 //! compact-v3 serialization, custom seeds, and p-sampling. It does not yet
@@ -54,17 +46,14 @@ namespace datasketches::cuda {
 //! compressed v4 images, or legacy serialization versions.
 //!
 //! CUDA work is explicit-resource: construction and every member function that
-//! touches the device take a caller-provided `cuda::stream_ref` as the first
-//! argument, and construction/deserialization require an explicit memory
-//! resource. Accessors that report sketch state take no stream because every
-//! operation that changes storage has already synchronized: the retained count
-//! determines the next allocation size, so it must be read back on the host.
-//! That also means there are no `_async` variants yet, unlike `hll_sketch`.
-//! Both follow from the same eager readback and will change together.
+//! touches device state takes a caller-provided `cuda::stream_ref`. Host-returning
+//! methods synchronize that stream before returning.
 //!
 //! **Stream lifetime.** The caller MUST keep the stream supplied at construction
 //! or deserialization alive until the sketch is destroyed. Retained buffers are
-//! rebound to that stream for stream-ordered deallocation.
+//! bound to that stream for stream-ordered deallocation. The caller must also
+//! ensure any stream used with `update_async` has completed, or is otherwise
+//! ordered before the construction stream, before destroying the sketch.
 //!
 //! @tparam Key Primitive input key type.
 //! @tparam MR Device-accessible memory resource type. Defaults to
@@ -86,8 +75,7 @@ class theta_sketch {
   //! @param[in] seed Hash seed; sketches built with different seeds cannot be
   //!   combined.
   //! @param[in] p Sampling probability, in (0, 1].
-  //! @throws std::invalid_argument if `lg_k` is outside [5, 26] or `p` is
-  //!   outside (0, 1].
+  //! @throws std::invalid_argument if `lg_k` is not 12 or `p` is outside (0, 1].
   theta_sketch(::cuda::stream_ref stream,
                MR mr,
                std::uint8_t lg_k  = default_lg_k,
@@ -102,9 +90,8 @@ class theta_sketch {
 
   //! @brief Bulk update on a caller-provided stream.
   //!
-  //! Hashes each key, screens it against theta, and folds the surviving hashes
-  //! into the retained set. Large batches are split internally so theta tightens
-  //! during the call. Synchronizes `stream` before returning.
+  //! Hashes each key, performs block-local reduction, and folds the surviving
+  //! hashes into the retained set. Synchronizes `stream` before returning.
   //!
   //! @tparam RandomAccessIt Random-access iterator type over device-accessible
   //!   keys.
@@ -115,6 +102,14 @@ class theta_sketch {
   //! @throws std::invalid_argument if `last` precedes `first`.
   template <class RandomAccessIt>
   void update(::cuda::stream_ref stream, RandomAccessIt first, RandomAccessIt last);
+
+  //! @brief Bulk update without stream synchronization.
+  //!
+  //! Operations on the same sketch must be ordered on the same stream or by the
+  //! caller. The caller must also ensure the stream has completed before
+  //! destroying the sketch.
+  template <class RandomAccessIt>
+  void update_async(::cuda::stream_ref stream, RandomAccessIt first, RandomAccessIt last);
 
   //! @brief Replace this sketch with the union of this and `other`.
   //!
@@ -159,16 +154,18 @@ class theta_sketch {
   //! @param[in] stream CUDA stream this operation is executed in.
   void reset(::cuda::stream_ref stream);
 
-  //! @brief True iff the sketch has seen no keys.
+  //! @brief True iff the sketch has seen no keys. Synchronizes `stream`.
   //!
+  //! @param[in] stream CUDA stream this operation is executed in.
   //! @return True iff the sketch has seen no keys.
-  [[nodiscard]] bool is_empty() const noexcept;
+  [[nodiscard]] bool is_empty(::cuda::stream_ref stream) const;
 
   //! @brief True iff theta has fallen below its maximum, so the retained count
-  //! no longer equals the exact distinct count.
+  //! no longer equals the exact distinct count. Synchronizes `stream`.
   //!
+  //! @param[in] stream CUDA stream this operation is executed in.
   //! @return True iff the sketch is in estimation mode.
-  [[nodiscard]] bool is_estimation_mode() const noexcept;
+  [[nodiscard]] bool is_estimation_mode(::cuda::stream_ref stream) const;
 
   //! @brief True iff the retained hashes are in ascending order.
   //!
@@ -183,42 +180,48 @@ class theta_sketch {
   //! @return The `lg_k` the sketch was constructed with.
   [[nodiscard]] std::uint8_t get_lg_k() const noexcept;
 
-  //! @brief Current theta as a raw 64-bit hash threshold.
+  //! @brief Current theta as a raw 64-bit hash threshold. Synchronizes `stream`.
   //!
+  //! @param[in] stream CUDA stream this operation is executed in.
   //! @return Theta in `[0, 2^63)`.
-  [[nodiscard]] std::uint64_t get_theta64() const noexcept;
+  [[nodiscard]] std::uint64_t get_theta64(::cuda::stream_ref stream) const;
 
-  //! @brief Current theta as a fraction of the hash space.
+  //! @brief Current theta as a fraction of the hash space. Synchronizes `stream`.
   //!
+  //! @param[in] stream CUDA stream this operation is executed in.
   //! @return Theta in `(0, 1]`.
-  [[nodiscard]] double get_theta() const noexcept;
+  [[nodiscard]] double get_theta(::cuda::stream_ref stream) const;
 
   //! @brief Hash of the seed, used to reject incompatible set operations.
   //!
   //! @return The 16-bit seed hash.
   [[nodiscard]] std::uint16_t get_seed_hash() const noexcept;
 
-  //! @brief Number of hashes the sketch currently retains, at most `2^lg_k`.
+  //! @brief Number of retained hashes. Synchronizes `stream`.
   //!
+  //! @param[in] stream CUDA stream this operation is executed in.
   //! @return The retained entry count.
-  [[nodiscard]] std::size_t get_num_retained() const noexcept;
+  [[nodiscard]] std::size_t get_num_retained(::cuda::stream_ref stream) const;
 
-  //! @brief Cardinality estimate.
+  //! @brief Cardinality estimate. Synchronizes `stream`.
   //!
+  //! @param[in] stream CUDA stream this operation is executed in.
   //! @return The cardinality estimate.
-  [[nodiscard]] double get_estimate() const noexcept;
+  [[nodiscard]] double get_estimate(::cuda::stream_ref stream) const;
 
-  //! @brief Lower bound on the estimate.
+  //! @brief Lower bound on the estimate. Synchronizes `stream`.
   //!
+  //! @param[in] stream CUDA stream this operation is executed in.
   //! @param[in] num_std_devs Confidence level: 1, 2, or 3.
   //! @return The lower bound, or the exact count when not in estimation mode.
-  [[nodiscard]] double get_lower_bound(std::uint8_t num_std_devs) const;
+  [[nodiscard]] double get_lower_bound(::cuda::stream_ref stream, std::uint8_t num_std_devs) const;
 
-  //! @brief Upper bound on the estimate.
+  //! @brief Upper bound on the estimate. Synchronizes `stream`.
   //!
+  //! @param[in] stream CUDA stream this operation is executed in.
   //! @param[in] num_std_devs Confidence level: 1, 2, or 3.
   //! @return The upper bound, or the exact count when not in estimation mode.
-  [[nodiscard]] double get_upper_bound(std::uint8_t num_std_devs) const;
+  [[nodiscard]] double get_upper_bound(::cuda::stream_ref stream, std::uint8_t num_std_devs) const;
 
   //! @brief Copy the ordered retained hashes to host memory.
   //!
@@ -238,8 +241,7 @@ class theta_sketch {
 
   //! @brief Deserialize an ordered, uncompressed compact Theta v3 image.
   //!
-  //! Compact Theta images do not encode nominal k, so `lg_k` must be supplied
-  //! by the caller when it differs from the default.
+  //! This prototype accepts only the default `lg_k` of 12.
   //!
   //! @param[in] stream CUDA stream this operation is executed in.
   //! @param[in] bytes Wire-format compact Theta v3 image.
